@@ -135,6 +135,10 @@ cleanup_cmd() {
 }
 trap cleanup_cmd EXIT
 
+# Fixed warm-up delay: gives tcpdump time to open the interface and start
+# capturing before the target command runs, so its very first packets land
+# in the .pcap. This is why single-command mode adds ~0.5s of visible
+# latency versus running the command unwrapped.
 sleep 0.5
 
 echo "Executing target command under strace..."
