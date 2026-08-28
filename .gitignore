@@ -1,0 +1,4 @@
+trace_wrap_mon
+trace_wrap_c_filter
+trace_output_*/
+*.swp
