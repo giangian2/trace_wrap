@@ -58,26 +58,21 @@ if [ "$MODE" == "shell" ]; then
     mkdir -p "${LOG_DIR}"
 
     STRACE_FIFO="${LOG_DIR}/strace.fifo"
-    TCPDUMP_FIFO="${LOG_DIR}/tcpdump.fifo"
-    mkfifo "${STRACE_FIFO}" "${TCPDUMP_FIFO}"
+    mkfifo "${STRACE_FIFO}"
 
     SESSION_NAME="trace_shell_${RAND_ID}"
-
-    echo "Starting background network capture..."
-    tcpdump -i any -nn -l 'tcp or udp or icmp or icmp6' 2>/dev/null > "${TCPDUMP_FIFO}" &
-    TCPDUMP_PID=$!
 
     echo "Launching interactive dev-shell in tmux..."
     tmux new-session -d -s "${SESSION_NAME}"
 
     ENV_PS1="\[\e[32m\](trace-shell)\[\e[0m\] \u@\h:\w# "
     tmux send-keys -t "${SESSION_NAME}" \
-      "strace -f -tt -T -e trace=file,network,process -o '${STRACE_FIFO}' bash --rcfile <(echo \"export PS1='${ENV_PS1}'\")" C-m
+      "strace -f -tt -T -yy -e trace=file,network,process,desc -o '${STRACE_FIFO}' bash --rcfile <(echo \"export PS1='${ENV_PS1}'\")" C-m
 
     # tmux >= 3.4 dropped -p in favour of -l <n>%; keep both for older tmux
     tmux split-window -v -t "${SESSION_NAME}" -l 40% 2>/dev/null \
       || tmux split-window -v -t "${SESSION_NAME}" -p 40
-    tmux send-keys -t "${SESSION_NAME}" "${BIN_DIR}/trace_wrap_mon '${STRACE_FIFO}' '${TCPDUMP_FIFO}'" C-m
+    tmux send-keys -t "${SESSION_NAME}" "${BIN_DIR}/trace_wrap_mon '${STRACE_FIFO}'" C-m
 
     tmux select-pane -t "${SESSION_NAME}" -U
 
@@ -108,7 +103,6 @@ if [ "$MODE" == "shell" ]; then
     tmux set-hook -t "${SESSION_NAME}" pane-exited "kill-session -t ${SESSION_NAME}" 2>/dev/null || true
 
     cleanup_shell() {
-        kill "${TCPDUMP_PID}" 2>/dev/null || true
         tmux kill-session -t "${SESSION_NAME}" 2>/dev/null || true
         rm -rf "${LOG_DIR}"
     }
@@ -145,6 +139,6 @@ sleep 0.5
 
 echo "Executing target command under strace..."
 echo "--------------------------------------------------------"
-strace -f -tt -T -x -o "${LOG_DIR}/syscalls.log" "${CMD[@]}" || true
+strace -f -tt -T -x -yy -o "${LOG_DIR}/syscalls.log" "${CMD[@]}" || true
 echo "--------------------------------------------------------"
 echo "Target process terminated."

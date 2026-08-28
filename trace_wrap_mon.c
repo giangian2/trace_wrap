@@ -170,6 +170,17 @@ static int scan_fd_annot(const char *line, FdInfo *fi) {
     return 0;
 }
 
+/* -yy labels pipes and anonymous inodes with the same "IDENT:[...]" shape it
+ * uses for sockets, so the identifier itself has to be looked at before a
+ * read() is called network activity. */
+static int proto_is_socket(const char *proto) {
+    static const char *fam[] = { "TCP", "UDP", "UNIX", "NETLINK", "SCTP",
+                                 "ICMP", "RAW", "PACKET", "SOCK", NULL };
+    for (int i = 0; fam[i]; i++)
+        if (strncmp(proto, fam[i], strlen(fam[i])) == 0) return 1;
+    return 0;
+}
+
 /* A unix socket names a path instead of an endpoint. */
 static void scan_unix_path(const char *line, char *dst, size_t cap) {
     const char *p = strstr(line, "sun_path=\"");
@@ -178,19 +189,33 @@ static void scan_unix_path(const char *line, char *dst, size_t cap) {
 }
 
 /* The sockaddr of a connect()/sendto() still matters: at connect time the
- * socket is not established yet, so the annotation has no peer in it. */
+ * socket is not established yet, so the annotation has no peer in it.
+ * IPv4 comes as        inet_addr("140.82.121.5")
+ * and IPv6 as          inet_pton(AF_INET6, "2606:4700::1", &sin6_addr)
+ * - the address is the first quoted string after the marker either way, so
+ * look for the quote rather than assuming it comes right after. */
 static void scan_sockaddr_peer(const char *line, char *dst, size_t cap) {
-    const char *a = strstr(line, "inet_addr(\"");
-    const char *b = strstr(line, "inet_pton(\"");
+    const char *a = strstr(line, "inet_addr(");
+    const char *b = strstr(line, "inet_pton(");
     if (!a || (b && b < a)) a = b;
+    if (a) a = strchr(a, '"');
     if (!a) { *dst = '\0'; return; }
 
     char ip[ENDP_LEN];
-    copy_until(ip, sizeof(ip), a + 11, "\"");
+    copy_until(ip, sizeof(ip), a + 1, "\"");
 
     const char *h = strstr(line, "htons(");
-    if (h) snprintf(dst, cap, "%.45s:%d", ip, atoi(h + 6));
-    else   snprintf(dst, cap, "%s", ip);
+    int port = h ? atoi(h + 6) : 0;
+
+    /* An IPv6 address is full of colons; bracket it so the port stays legible,
+     * the way strace's own annotations write it. */
+    if (strchr(ip, ':')) {
+        if (port) snprintf(dst, cap, "[%.45s]:%d", ip, port);
+        else      snprintf(dst, cap, "[%.45s]", ip);
+    } else {
+        if (port) snprintf(dst, cap, "%.45s:%d", ip, port);
+        else      snprintf(dst, cap, "%s", ip);
+    }
 }
 
 typedef enum { D_PLAIN, D_OUT, D_IN, D_CONN, D_ACCEPT, D_CLOSE } Dir;
@@ -280,7 +305,7 @@ static int fmt_net(Event *e, const char *p, const char *ret) {
         snprintf(info + at, sizeof(info) - at, "%s%ss", at ? "  " : "", dur);
     }
 
-    snprintf(e->disp, sizeof(e->disp), "%-12.12s %6ld  %-11.11s %s %-9.9s %-42.42s %s",
+    snprintf(e->disp, sizeof(e->disp), "%-12.12s %6ld %-8.8s %s %-9.9s %-24.24s %s",
              e->ts, e->pid, fi.proto[0] ? fi.proto : "-",
              dir_glyph(d), e->name, peer[0] ? peer : "-", info);
     return 1;
@@ -327,6 +352,17 @@ static const char *netcalls[] = {
     "sendto", "recvfrom", "sendmsg", "recvmsg", "sendmmsg", "recvmmsg",
     "send", "recv", "getpeername", "getsockname", "setsockopt", "getsockopt",
     "shutdown",
+    NULL
+};
+
+/* Nothing here is a network call by name - it depends entirely on what the
+ * descriptor turns out to be. Most programs never call send()/recv() at all:
+ * curl, nginx and anything built on a generic I/O layer write to a socket the
+ * same way they write to a file, so without these the network pane would show
+ * the connect() and none of the conversation that follows. */
+static const char *iocalls[] = {
+    "read", "write", "readv", "writev", "pread64", "pwrite64",
+    "preadv", "pwritev", "preadv2", "pwritev2", "sendfile", "close",
     NULL
 };
 
@@ -424,12 +460,22 @@ static int parse_strace(const char *line, Event *e) {
     while ((q = strstr(q, " = ")) != NULL) { ret = q + 3; q += 3; }
     if (ret && *ret == '-') e->failed = 1;
 
-    if (name_in(e->name, ignored))  return 0;
     if (name_in(e->name, netcalls)) {
         if (name_in(e->name, netquiet)) return 0;
         e->type = EV_NET;
         return fmt_net(e, p, ret);
     }
+    /* read/write/close are in the ignore list because on a file they are
+     * noise; on a socket they are the traffic itself. The annotation decides,
+     * so this has to come first. */
+    if (name_in(e->name, iocalls)) {
+        FdInfo fi;
+        if (scan_fd_annot(p, &fi) && proto_is_socket(fi.proto)) {
+            e->type = EV_NET;
+            return fmt_net(e, p, ret);
+        }
+    }
+    if (name_in(e->name, ignored))   return 0;
     if (name_in(e->name, filecalls)) e->type = EV_SYS;
     else if (e->failed)              e->type = EV_ERR;
     else                             return 0;
@@ -475,7 +521,10 @@ static void src_pump(Source *s) {
             s->len = 0;
         }
 
-        ssize_t n = read(s->fd, s->buf + s->len, sizeof(s->buf) - s->len - 1);
+        size_t room = sizeof(s->buf) - 1 - s->len;
+        if (room > sizeof(s->buf) - 1) room = sizeof(s->buf) - 1;   /* gcc hint */
+
+        ssize_t n = read(s->fd, s->buf + s->len, room);
         if (n < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -639,7 +688,7 @@ static void render(void) {
 
     g_outlen = 0;
     draw_pane(PANE_NET, 2, h_net,
-              "[ NETWORK  time      pid  proto       dir op        peer ]");
+              "[ NETWORK - time pid proto dir syscall peer bytes/duration ]");
     draw_pane(PANE_SYS, split + 1, h_sys, "[ FILES, PROCESSES & ERRORS ]");
     draw_status();
     oflush();
