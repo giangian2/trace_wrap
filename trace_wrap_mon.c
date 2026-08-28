@@ -1,11 +1,17 @@
 /*
  * trace_wrap_mon - live monitor for trace_wrap.
  *
- * Reads two FIFOs (strace text output, tcpdump text output), parses each line
- * into a structured event, and renders them in a two-pane terminal UI.
- * Replaces the old trace_wrap_c_filter + trace_wrap_tui.sh pair: parsing and
- * rendering now share one process, so the parsed fields survive all the way to
- * the screen and can be scrolled, paused and filtered.
+ * Reads strace's output from a FIFO, parses each line into a structured event
+ * and renders it in a two-pane terminal UI: network activity on top, file and
+ * process activity plus errors below.
+ *
+ * There used to be a second source here - tcpdump - and a whole flow-table
+ * machinery whose only job was to guess which packets on the wire belonged to
+ * the traced process. It is gone. strace -yy annotates every descriptor with
+ * the socket behind it, endpoints included, so the network view is built from
+ * the syscalls themselves: who talked, over which protocol, in which
+ * direction, with whom, how many bytes, and how long it took. No correlation
+ * to get wrong, no privileges to ask for, no packets to sift.
  *
  * Terminal handling is raw termios + ANSI escapes; no ncurses dependency.
  */
@@ -25,79 +31,54 @@
 #include <unistd.h>
 
 #define MAX_LINE   2048
-#define RING_CAP   8192
+#define DISP_LEN   192
+#define RING_CAP   4096
 #define SRC_BUF    (MAX_LINE * 4)
 #define OUT_BUF    (1 << 20)
 #define MAX_FILTER 96
+#define ENDP_LEN   64
 
 /* ------------------------------------------------------------------ events */
 
-typedef enum { EV_SYS_NET = 0, EV_RAW_NET, EV_SYS, EV_ERR } EvType;
+typedef enum { EV_NET = 0, EV_SYS, EV_ERR } EvType;
 
 typedef struct {
     EvType type;
-    long   pid;              /* -1 when unknown */
-    int    failed;           /* syscall returned a negative value */
-    char   ts[24];           /* timestamp as printed by strace -tt */
-    char   name[32];         /* syscall name, or "pkt" for raw packets */
-    char   text[MAX_LINE];   /* full original line, newline stripped */
+    long   pid;                /* -1 when unknown */
+    int    failed;             /* syscall returned a real error */
+    char   ts[16];             /* timestamp as printed by strace -tt */
+    char   name[32];           /* syscall name */
+    char   text[MAX_LINE];     /* the original strace line, newline stripped */
+    char   disp[DISP_LEN];     /* rendered network line; empty for EV_SYS */
 } Event;
 
 typedef struct {
     Event  ev[RING_CAP];
-    size_t head;             /* next slot to write */
-    size_t count;            /* live entries, capped at RING_CAP */
-    size_t total;            /* events ever pushed, for the status bar */
-    size_t scroll;           /* 0 = follow tail, N = N matching lines back */
+    size_t head;               /* next slot to write */
+    size_t count;              /* live entries, capped at RING_CAP */
+    size_t total;              /* events ever pushed, for the status bar */
+    size_t scroll;             /* 0 = follow tail, N = N matching lines back */
 } Ring;
 
 enum { PANE_NET = 0, PANE_SYS = 1, PANE_N = 2 };
 
 static Ring g_ring[PANE_N];
 
-/* How tightly raw tcpdump lines are filtered against what strace saw. */
-typedef enum {
-    PKT_FLOW = 0,   /* both endpoints must match a socket of the traced proc */
-    PKT_PEER,       /* any peer address the traced process talked to         */
-    PKT_ALL,        /* everything tcpdump hands us                           */
-    PKT_MODE_N
-} PktMode;
-
 /* --------------------------------------------------------------- ui state */
 
 static int   g_rows = 24, g_cols = 80;
-static int   g_active = PANE_SYS;
+static int   g_active = PANE_NET;
 static int   g_paused = 0;
 static int   g_quit = 0;
 static int   g_dirty = 1;
 static int   g_editing = 0;                  /* filter prompt is open */
+static int   g_raw = 0;                      /* show raw strace lines up top */
 static char  g_filter[MAX_FILTER] = "";
-static int   g_pkt_mode = PKT_FLOW;          /* how hard to filter raw packets */
 static char  g_edit[MAX_FILTER] = "";
 static size_t g_edit_len = 0;
 
 static volatile sig_atomic_t g_resized = 1;
 static volatile sig_atomic_t g_signalled = 0;
-
-/* Sockets the traced process opened, keyed by the (pid, fd) pair strace
- * prints. tcpdump sees every packet on the host and has no idea which process
- * owns one; strace knows the process but never sees the wire. The connection
- * itself is the bridge - and it has to be the whole connection, because a peer
- * address alone is not discriminating: two programs both talking to GitHub
- * share it, and every packet of the other one would be attributed to us. */
-#define MAX_FLOWS 128
-#define ADDR_LEN  46                          /* fits an IPv6 text address */
-
-typedef struct {
-    long pid, fd;                             /* identity, as strace sees it */
-    char peer_ip[ADDR_LEN];  int peer_port;   /* port 0 = not known (yet)    */
-    char loc_ip[ADDR_LEN];   int loc_port;
-    int  probes;                              /* /proc lookups already spent */
-} Flow;
-
-static Flow g_flow[MAX_FLOWS];
-static int  g_flow_n;
-static int  g_flow_next;                      /* round-robin slot once full */
 
 static struct termios g_saved_tio;
 static int g_tio_saved = 0;
@@ -138,201 +119,184 @@ static void oflush(void) {
     g_outlen = 0;
 }
 
-/* --------------------------------------------------- flow correlation */
+/* --------------------------------------------------------- network events
+ * strace -yy annotates every descriptor with what sits behind it:
+ *   5<TCP:[172.17.163.162:52590->104.20.23.154:443]>   an established socket
+ *   5<TCP:[967498]>                                    a socket, not yet connected
+ *   7<UDP:[965268]>
+ *   3<UNIX-STREAM:[965263]>                            a unix socket
+ *   3</etc/passwd>                                     a plain file
+ * Everything the old flow table used to reconstruct from /proc is right here,
+ * on the very line that reports the syscall.
+ */
 
-static Flow *flow_get(long pid, long fd) {
-    if (pid < 0 || fd < 0) return NULL;
-    for (int i = 0; i < g_flow_n; i++)
-        if (g_flow[i].pid == pid && g_flow[i].fd == fd) return &g_flow[i];
+typedef struct {
+    char proto[12];            /* "TCP", "UDP", "UNIX-STREAM", ... */
+    char local[ENDP_LEN];      /* "172.17.163.162:52590", or empty */
+    char peer[ENDP_LEN];       /* "104.20.23.154:443", or empty     */
+} FdInfo;
 
-    Flow *f;
-    if (g_flow_n < MAX_FLOWS) {
-        f = &g_flow[g_flow_n++];
-    } else {
-        f = &g_flow[g_flow_next];
-        g_flow_next = (g_flow_next + 1) % MAX_FLOWS;
-    }
-    memset(f, 0, sizeof(*f));
-    f->pid = pid;
-    f->fd  = fd;
-    return f;
-}
-
-static int addr_wildcard(const char *ip) {
-    return strcmp(ip, "0.0.0.0") == 0 || strcmp(ip, "::") == 0;
-}
-
-static int addr_loopback(const char *ip) {
-    return strcmp(ip, "127.0.0.1") == 0 || strcmp(ip, "::1") == 0;
-}
-
-/* Pulls one endpoint out of the sockaddr strace prints:
- *   {sa_family=AF_INET,  sin_port=htons(443),  sin_addr=inet_addr("140.82.121.5")}
- *   {sa_family=AF_INET6, sin6_port=htons(443), sin6_addr=inet_pton("2001:db8::1")}
- * Returns 1 when at least an address came out.                              */
-static int scan_sockaddr(const char *s, char *ip, size_t cap, int *port) {
-    ip[0] = '\0';
-    *port = 0;
-
-    const char *a = strstr(s, "inet_addr(\"");
-    const char *b = strstr(s, "inet_pton(\"");
-    if (!a || (b && b < a)) a = b;
-    if (!a) return 0;
-    a += 11;                                  /* both markers are 11 chars */
-
+static void copy_until(char *dst, size_t cap, const char *src, const char *stop) {
     size_t k = 0;
-    while (a[k] && a[k] != '"' && k < cap - 1) { ip[k] = a[k]; k++; }
-    ip[k] = '\0';
-
-    const char *h = strstr(s, "htons(");
-    if (h) *port = atoi(h + 6);
-    return ip[0] != '\0';
+    while (src[k] && !strchr(stop, src[k]) && k < cap - 1) { dst[k] = src[k]; k++; }
+    dst[k] = '\0';
 }
 
-/* Rows of /proc/net/{tcp,udp}{,6} carry the socket inode and its local port:
- *   sl  local_address rem_address st tx:rx tr:when rtx uid timeout inode
- *    0: 0100007F:1F90 00000000:0000 0A ...                          20095
- * Addresses are hex; only the port after the colon interests us here.       */
-static int proc_port_of_inode(const char *table, unsigned long want, int *port) {
-    FILE *fp = fopen(table, "r");
-    if (!fp) return 0;
+/* Finds the first "<IDENT:[...]>" of the line and pulls it apart. Plain-file
+ * annotations carry no "IDENT:[" and are skipped, which is exactly how a read
+ * on a socket is told apart from a read on a file. */
+static int scan_fd_annot(const char *line, FdInfo *fi) {
+    fi->proto[0] = fi->local[0] = fi->peer[0] = '\0';
 
-    char line[512];
-    int found = 0;
-    while (!found && fgets(line, sizeof(line), fp)) {
-        unsigned int  lport;
-        unsigned long ino;
-        if (sscanf(line, " %*d: %*64[0-9A-Fa-f]:%X %*64[0-9A-Fa-f]:%*X"
-                         " %*X %*X:%*X %*X:%*X %*X %*d %*d %lu",
-                   &lport, &ino) == 2 && ino == want) {
-            *port = (int)lport;
-            found = 1;
+    for (const char *p = strchr(line, '<'); p; p = strchr(p + 1, '<')) {
+        const char *c = p + 1;
+        while (isalnum((unsigned char)*c) || *c == '_' || *c == '-') c++;
+        if (*c != ':' || c[1] != '[' || c == p + 1) continue;
+
+        size_t plen = (size_t)(c - p - 1);
+        if (plen >= sizeof(fi->proto)) plen = sizeof(fi->proto) - 1;
+        memcpy(fi->proto, p + 1, plen);
+        fi->proto[plen] = '\0';
+
+        const char *body = c + 2;
+        const char *arrow = strstr(body, "->");
+        const char *end   = strchr(body, ']');
+        if (arrow && end && arrow < end) {
+            copy_until(fi->local, sizeof(fi->local), body, "-");
+            copy_until(fi->peer,  sizeof(fi->peer),  arrow + 2, "]");
         }
-    }
-    fclose(fp);
-    return found;
-}
-
-/* The local port is what actually discriminates one process from another, but
- * waiting for getsockname() to hand it to us is hopeless: hardly any program
- * calls it. Do instead what ss and lsof do - /proc/<pid>/fd/<n> names the
- * socket inode, and the /proc/net tables map that inode to a port. Needs no
- * cooperation from the traced program, only that the socket still be open
- * when we look, which for anything but the shortest exchange it is.         */
-static void flow_probe_local(Flow *f) {
-    if (f->loc_port || f->probes >= 3) return;
-    f->probes++;
-
-    char path[64], link[64];
-    snprintf(path, sizeof(path), "/proc/%ld/fd/%ld", f->pid, f->fd);
-    ssize_t n = readlink(path, link, sizeof(link) - 1);
-    if (n <= 0) return;
-    link[n] = '\0';
-
-    unsigned long ino;
-    if (sscanf(link, "socket:[%lu]", &ino) != 1) return;
-
-    static const char *tables[] = { "/proc/net/tcp", "/proc/net/tcp6",
-                                    "/proc/net/udp", "/proc/net/udp6", NULL };
-    for (int i = 0; tables[i]; i++)
-        if (proc_port_of_inode(tables[i], ino, &f->loc_port)) return;
-}
-
-/* One end of a packet against one end of a flow. Unknown fields do not veto:
- * a flow we only know the port of still matches on that port. */
-static int end_eq(const char *ip, int port, const char *fip, int fport) {
-    if (!fip[0] && !fport)               return 0;   /* nothing known at all */
-    if (fip[0] && strcmp(ip, fip) != 0)  return 0;
-    if (fport  && port != fport)         return 0;
-    return 1;
-}
-
-/* tcpdump -nn writes an endpoint as "address.port", so the port is whatever
- * follows the LAST dot - true of 192.168.1.10.52134 and of 2001:db8::1.443
- * alike. The 'tcp or udp' filter guarantees a port is always there.         */
-static int split_end(const char *tok, size_t len, char *ip, size_t cap, int *port) {
-    while (len && (tok[len - 1] == ':' || tok[len - 1] == ',')) len--;
-
-    const char *dot = NULL;
-    for (size_t i = 0; i < len; i++)
-        if (tok[i] == '.') dot = tok + i;
-    if (!dot || dot + 1 >= tok + len) return 0;
-
-    for (const char *c = dot + 1; c < tok + len; c++)
-        if (!isdigit((unsigned char)*c)) return 0;
-
-    size_t iplen = (size_t)(dot - tok);
-    if (iplen == 0 || iplen >= cap) return 0;
-    memcpy(ip, tok, iplen);
-    ip[iplen] = '\0';
-    *port = atoi(dot + 1);
-    return 1;
-}
-
-/* The two ends sit around the '>' that follows the IP/IP6 keyword:
- *   15:04:23.918 eth0  Out IP 192.168.1.10.52134 > 140.82.121.5.443: Flags [S] */
-static int pkt_ends(const char *line, char *sip, int *sport,
-                                      char *dip, int *dport) {
-    const char *p;
-    if ((p = strstr(line, " IP ")) != NULL)       p += 4;
-    else if ((p = strstr(line, " IP6 ")) != NULL) p += 5;
-    else return 0;
-
-    const char *beg = p;
-    while (*p && *p != ' ') p++;
-    if (!split_end(beg, (size_t)(p - beg), sip, ADDR_LEN, sport)) return 0;
-
-    while (*p == ' ') p++;
-    if (*p != '>') return 0;
-    p++;
-    while (*p == ' ') p++;
-
-    beg = p;
-    while (*p && *p != ' ') p++;
-    return split_end(beg, (size_t)(p - beg), dip, ADDR_LEN, dport);
-}
-
-static int pkt_is_ours(const char *line) {
-    char sip[ADDR_LEN], dip[ADDR_LEN];
-    int  sport, dport;
-    if (!pkt_ends(line, sip, &sport, dip, &dport)) return 0;
-
-    for (int i = 0; i < g_flow_n; i++) {
-        Flow *f = &g_flow[i];
-        if (!f->peer_ip[0] && !f->peer_port) continue;
-
-        /* No local end yet - the program never called bind/getsockname and the
-         * socket was already gone when /proc was read. Fall back to the peer
-         * end, still tighter than matching an IP anywhere in the line. */
-        if (!f->loc_ip[0] && !f->loc_port) {
-            if (end_eq(sip, sport, f->peer_ip, f->peer_port) ||
-                end_eq(dip, dport, f->peer_ip, f->peer_port)) return 1;
-            continue;
-        }
-        if (end_eq(sip, sport, f->loc_ip,  f->loc_port) &&
-            end_eq(dip, dport, f->peer_ip, f->peer_port)) return 1;
-        if (end_eq(sip, sport, f->peer_ip, f->peer_port) &&
-            end_eq(dip, dport, f->loc_ip,  f->loc_port))  return 1;
+        return 1;
     }
     return 0;
 }
 
-/* Loose mode: any peer address anywhere in the line, whatever the ports. */
-static int pkt_has_peer(const char *line) {
-    for (int i = 0; i < g_flow_n; i++)
-        if (g_flow[i].peer_ip[0] && strstr(line, g_flow[i].peer_ip)) return 1;
-    return 0;
+/* A unix socket names a path instead of an endpoint. */
+static void scan_unix_path(const char *line, char *dst, size_t cap) {
+    const char *p = strstr(line, "sun_path=\"");
+    if (!p) { *dst = '\0'; return; }
+    copy_until(dst, cap, p + 10, "\"");
 }
 
-static int matches(const Event *e) {
-    if (e->type == EV_RAW_NET) {
-        if (g_pkt_mode == PKT_FLOW && !pkt_is_ours(e->text))  return 0;
-        if (g_pkt_mode == PKT_PEER && !pkt_has_peer(e->text)) return 0;
+/* The sockaddr of a connect()/sendto() still matters: at connect time the
+ * socket is not established yet, so the annotation has no peer in it. */
+static void scan_sockaddr_peer(const char *line, char *dst, size_t cap) {
+    const char *a = strstr(line, "inet_addr(\"");
+    const char *b = strstr(line, "inet_pton(\"");
+    if (!a || (b && b < a)) a = b;
+    if (!a) { *dst = '\0'; return; }
+
+    char ip[ENDP_LEN];
+    copy_until(ip, sizeof(ip), a + 11, "\"");
+
+    const char *h = strstr(line, "htons(");
+    if (h) snprintf(dst, cap, "%.45s:%d", ip, atoi(h + 6));
+    else   snprintf(dst, cap, "%s", ip);
+}
+
+typedef enum { D_PLAIN, D_OUT, D_IN, D_CONN, D_ACCEPT, D_CLOSE } Dir;
+
+static const char *dir_glyph(Dir d) {
+    switch (d) {
+        case D_OUT:    return "\xe2\x86\x91";   /* up arrow    */
+        case D_IN:     return "\xe2\x86\x93";   /* down arrow  */
+        case D_CONN:   return "\xe2\x86\x92";   /* right arrow */
+        case D_ACCEPT: return "\xe2\x86\x90";   /* left arrow  */
+        case D_CLOSE:  return "\xc3\x97";       /* multiply    */
+        default:       return " ";
     }
-    return g_filter[0] == '\0' || strcasestr(e->text, g_filter) != NULL;
+}
+
+static Dir dir_of(const char *name) {
+    if (!strncmp(name, "send", 4) || !strcmp(name, "write") ||
+        !strcmp(name, "writev"))                        return D_OUT;
+    if (!strncmp(name, "recv", 4) || !strcmp(name, "read") ||
+        !strcmp(name, "readv"))                         return D_IN;
+    if (!strcmp(name, "connect"))                       return D_CONN;
+    if (!strncmp(name, "accept", 6))                    return D_ACCEPT;
+    if (!strcmp(name, "shutdown") || !strcmp(name, "close")) return D_CLOSE;
+    return D_PLAIN;
+}
+
+/* strace -T appends the time spent inside the call: "... = 0 <0.000123>" */
+static void scan_duration(const char *line, char *dst, size_t cap) {
+    *dst = '\0';
+    size_t n = strlen(line);
+    if (n < 4 || line[n - 1] != '>') return;
+    const char *lt = NULL;
+    for (const char *p = line + n - 1; p > line; p--)
+        if (*p == '<') { lt = p; break; }
+    if (lt && isdigit((unsigned char)lt[1]))
+        copy_until(dst, cap, lt + 1, ">");
+}
+
+/* "= -1 ECONNREFUSED (Connection refused)" -> "ECONNREFUSED" */
+static void scan_errno(const char *ret, char *dst, size_t cap) {
+    *dst = '\0';
+    if (!ret || *ret != '-') return;
+    const char *p = ret;
+    while (*p && *p != ' ') p++;
+    while (*p == ' ') p++;
+    if (isupper((unsigned char)*p)) copy_until(dst, cap, p, " (");
+}
+
+/* A non-blocking socket reports "would block" and "in progress" as errors.
+ * They are ordinary flow control, not failures, and colouring them red would
+ * paint half the screen for any async client. */
+static int errno_benign(const char *e) {
+    return !strcmp(e, "EAGAIN") || !strcmp(e, "EWOULDBLOCK") ||
+           !strcmp(e, "EINPROGRESS") || !strcmp(e, "EINTR");
+}
+
+/* Builds the one-line rendering of a network syscall. Returns 0 to drop the
+ * event entirely - plumbing calls and reads that moved nothing. */
+static int fmt_net(Event *e, const char *p, const char *ret) {
+    FdInfo fi;
+    scan_fd_annot(p, &fi);
+
+    Dir  d = dir_of(e->name);
+    char err[32], dur[16], peer[ENDP_LEN], info[64] = "";
+
+    scan_errno(ret, err, sizeof(err));
+    scan_duration(p, dur, sizeof(dur));
+
+    /* Nothing moved and nothing broke: a poll disguised as a read. */
+    if ((d == D_OUT || d == D_IN) && err[0] && errno_benign(err)) return 0;
+
+    e->failed = err[0] && !errno_benign(err);
+
+    snprintf(peer, sizeof(peer), "%s", fi.peer);
+    if (!peer[0]) scan_sockaddr_peer(p, peer, sizeof(peer));
+    if (!peer[0]) scan_unix_path(p, peer, sizeof(peer));
+    if (!peer[0] && fi.local[0]) snprintf(peer, sizeof(peer), "%s", fi.local);
+
+    if (err[0]) {
+        snprintf(info, sizeof(info), "%s", err);
+    } else if ((d == D_OUT || d == D_IN) && ret) {
+        long n = strtol(ret, NULL, 10);
+        if (n >= 0) snprintf(info, sizeof(info), "%ld B", n);
+    }
+    if (dur[0]) {
+        size_t at = strlen(info);
+        snprintf(info + at, sizeof(info) - at, "%s%ss", at ? "  " : "", dur);
+    }
+
+    snprintf(e->disp, sizeof(e->disp), "%-12.12s %6ld  %-11.11s %s %-9.9s %-42.42s %s",
+             e->ts, e->pid, fi.proto[0] ? fi.proto : "-",
+             dir_glyph(d), e->name, peer[0] ? peer : "-", info);
+    return 1;
 }
 
 /* ------------------------------------------------------------------- ring */
+
+static const char *ev_shown(const Event *e) {
+    return (e->type == EV_NET && !g_raw && e->disp[0]) ? e->disp : e->text;
+}
+
+static int matches(const Event *e) {
+    if (g_filter[0] == '\0') return 1;
+    return strcasestr(e->text, g_filter) != NULL ||
+           (e->disp[0] && strcasestr(e->disp, g_filter) != NULL);
+}
 
 static Event *ring_at(Ring *r, size_t k) {   /* k = 0 is the oldest entry */
     return &r->ev[(r->head + RING_CAP - r->count + k) % RING_CAP];
@@ -351,35 +315,27 @@ static void ring_push(Ring *r, const Event *e) {
 
 /* ---------------------------------------------------------------- parsing */
 
-static const char *ignored[] = {
-    "futex", "epoll_wait", "epoll_pwait", "epoll_ctl", "clock_gettime",
-    "clock_nanosleep", "gettimeofday", "rt_sigprocmask", "rt_sigaction",
-    "rt_sigreturn", "mmap", "mmap2", "munmap", "mprotect", "brk", "close",
-    "read", "pread64", "write", "pwrite64", "fstat", "newfstatat", "lseek",
-    "poll", "ppoll", "pselect6", "select", "getpid", "gettid", "sched_yield",
+/* Socket plumbing: it says nothing about who talked to whom, and setsockopt
+ * alone fires four times per connection. */
+static const char *netquiet[] = {
+    "setsockopt", "getsockopt", "getsockname", "getpeername", "socketpair",
     NULL
 };
 
 static const char *netcalls[] = {
     "socket", "socketpair", "connect", "accept", "accept4", "bind", "listen",
     "sendto", "recvfrom", "sendmsg", "recvmsg", "sendmmsg", "recvmmsg",
-    "getpeername", "getsockname", "setsockopt", "shutdown",
+    "send", "recv", "getpeername", "getsockname", "setsockopt", "getsockopt",
+    "shutdown",
     NULL
 };
 
-/* Only these carry a PEER address. bind/getsockname/socketpair report the
- * LOCAL end - feeding those to the peer table poisons it with our own IP,
- * which then matches every single packet on the host. */
-static const char *peercalls[] = {
-    "connect", "accept", "accept4", "sendto", "recvfrom", "sendmsg",
-    "recvmsg", "sendmmsg", "recvmmsg", "getpeername",
-    NULL
-};
-
-/* ...and these carry the LOCAL one. Keeping the two apart is the whole point:
- * a local address in the peer column matches every packet on the host. */
-static const char *localcalls[] = {
-    "bind", "getsockname",
+static const char *ignored[] = {
+    "futex", "epoll_wait", "epoll_pwait", "epoll_ctl", "clock_gettime",
+    "clock_nanosleep", "gettimeofday", "rt_sigprocmask", "rt_sigaction",
+    "rt_sigreturn", "mmap", "mmap2", "munmap", "mprotect", "brk", "close",
+    "read", "pread64", "write", "pwrite64", "fstat", "newfstatat", "lseek",
+    "poll", "ppoll", "pselect6", "select", "getpid", "gettid", "sched_yield",
     NULL
 };
 
@@ -409,55 +365,6 @@ static size_t take_name(const char *p, char *dst, size_t cap) {
     return k;
 }
 
-/* The descriptor is the first argument: "connect(3, {...}". */
-static long take_arg_fd(const char *p) {
-    const char *o = strchr(p, '(');
-    if (!o) return -1;
-    char *end;
-    long v = strtol(o + 1, &end, 10);
-    return end > o + 1 ? v : -1;
-}
-
-/* Feeds one network syscall into the flow table, so that raw tcpdump lines can
- * later be matched against real connections instead of bare peer addresses. */
-static void track_flow(const Event *e, const char *p, const char *ret) {
-    int is_peer  = name_in(e->name, peercalls);
-    int is_local = name_in(e->name, localcalls);
-    if (!is_peer && !is_local) return;
-
-    char ip[ADDR_LEN];
-    int  port;
-    if (!scan_sockaddr(p, ip, sizeof(ip), &port)) return;
-    if (is_peer && (addr_wildcard(ip) || addr_loopback(ip))) return;
-
-    /* accept() hands back a NEW descriptor, and it is that one - not the
-     * listening socket - that the packets belong to. */
-    long fd;
-    if (ret && (strcmp(e->name, "accept") == 0 || strcmp(e->name, "accept4") == 0))
-        fd = strtol(ret, NULL, 10);
-    else
-        fd = take_arg_fd(p);
-
-    Flow *f = flow_get(e->pid, fd);
-    if (!f) return;
-
-    if (is_peer) {
-        /* A different peer on the same fd means the number was recycled onto
-         * another socket: the local end we had cached no longer applies. */
-        if (f->peer_ip[0] && strcmp(f->peer_ip, ip) != 0) {
-            f->loc_ip[0] = '\0';
-            f->loc_port  = 0;
-            f->probes    = 0;
-        }
-        snprintf(f->peer_ip, sizeof(f->peer_ip), "%s", ip);
-        if (port) f->peer_port = port;
-        flow_probe_local(f);
-    } else {
-        if (!addr_wildcard(ip)) snprintf(f->loc_ip, sizeof(f->loc_ip), "%s", ip);
-        if (port) f->loc_port = port;
-    }
-}
-
 /* Returns 1 if the line produced an event worth showing, 0 to drop it. */
 static int parse_strace(const char *line, Event *e) {
     const char *p = line;
@@ -466,6 +373,7 @@ static int parse_strace(const char *line, Event *e) {
     e->failed = 0;
     e->ts[0] = '\0';
     e->name[0] = '\0';
+    e->disp[0] = '\0';
     snprintf(e->text, sizeof(e->text), "%s", line);
 
     while (*p == ' ' || *p == '\t') p++;
@@ -516,37 +424,26 @@ static int parse_strace(const char *line, Event *e) {
     while ((q = strstr(q, " = ")) != NULL) { ret = q + 3; q += 3; }
     if (ret && *ret == '-') e->failed = 1;
 
-    if (name_in(e->name, ignored))        return 0;
-    if (name_in(e->name, netcalls))       { e->type = EV_SYS_NET; track_flow(e, p, ret); }
-    else if (name_in(e->name, filecalls)) e->type = EV_SYS;
-    else if (e->failed)                   e->type = EV_ERR;
-    else                                  return 0;
-    return 1;
-}
-
-static int parse_pcap(const char *line, Event *e) {
-    if (*line == '\0') return 0;
-    /* local resolver chatter: loopback traffic on port 53 */
-    if (strstr(line, "127.0.0.1") && strstr(line, ".53")) return 0;
-
-    e->type = EV_RAW_NET;
-    e->pid = -1;
-    e->failed = 0;
-    e->ts[0] = '\0';
-    snprintf(e->name, sizeof(e->name), "pkt");
-    snprintf(e->text, sizeof(e->text), "%s", line);
+    if (name_in(e->name, ignored))  return 0;
+    if (name_in(e->name, netcalls)) {
+        if (name_in(e->name, netquiet)) return 0;
+        e->type = EV_NET;
+        return fmt_net(e, p, ret);
+    }
+    if (name_in(e->name, filecalls)) e->type = EV_SYS;
+    else if (e->failed)              e->type = EV_ERR;
+    else                             return 0;
     return 1;
 }
 
 static void emit(const Event *e) {
-    ring_push(&g_ring[e->type == EV_SYS_NET || e->type == EV_RAW_NET
-                      ? PANE_NET : PANE_SYS], e);
+    ring_push(&g_ring[e->type == EV_NET ? PANE_NET : PANE_SYS], e);
     g_dirty = 1;
 }
 
-/* ------------------------------------------------------------ line sources
- * read() on a non-blocking fd hands back arbitrary chunks, so each source
- * keeps a carry buffer holding the tail of a line until its newline shows up.
+/* ------------------------------------------------------------- line source
+ * read() on a non-blocking fd hands back arbitrary chunks, so the source keeps
+ * a carry buffer holding the tail of a line until its newline shows up.
  */
 
 typedef struct {
@@ -554,22 +451,30 @@ typedef struct {
     int    eof;
     size_t len;
     char   buf[SRC_BUF];
-    int  (*parse)(const char *line, Event *e);
 } Source;
 
-static void src_line(Source *s, char *line) {
+static void src_line(char *line) {
     size_t n = strlen(line);
     while (n && (line[n - 1] == '\r' || line[n - 1] == ' ')) line[--n] = '\0';
     if (n == 0) return;
 
     Event e;
-    if (s->parse(line, &e)) emit(&e);
+    if (parse_strace(line, &e)) emit(&e);
 }
 
 static void src_pump(Source *s) {
     if (s->fd < 0) return;
 
     for (;;) {
+        /* A line longer than the buffer would wedge us forever: flush it and
+         * start over, which also proves to the compiler that len stays in
+         * range for the read() below. */
+        if (s->len >= sizeof(s->buf) - 1) {
+            s->buf[sizeof(s->buf) - 1] = '\0';
+            src_line(s->buf);
+            s->len = 0;
+        }
+
         ssize_t n = read(s->fd, s->buf + s->len, sizeof(s->buf) - s->len - 1);
         if (n < 0) {
             if (errno == EINTR) continue;
@@ -585,18 +490,11 @@ static void src_pump(Source *s) {
         char *start = s->buf, *nl;
         while ((nl = memchr(start, '\n', s->len - (size_t)(start - s->buf)))) {
             *nl = '\0';
-            src_line(s, start);
+            src_line(start);
             start = nl + 1;
         }
         s->len -= (size_t)(start - s->buf);
         memmove(s->buf, start, s->len);
-
-        /* A line longer than the buffer would wedge us forever: flush it. */
-        if (s->len == sizeof(s->buf) - 1) {
-            s->buf[s->len] = '\0';
-            src_line(s, s->buf);
-            s->len = 0;
-        }
     }
 }
 
@@ -656,10 +554,15 @@ static void term_size(void) {
 static const char *ev_color(const Event *e) {
     if (e->failed) return "\x1b[1;31m";
     switch (e->type) {
-        case EV_SYS_NET: return "\x1b[1;32m";
-        case EV_RAW_NET: return "\x1b[36m";
-        case EV_ERR:     return "\x1b[1;31m";
-        default:         return "\x1b[37m";
+        case EV_NET: {
+            Dir d = dir_of(e->name);
+            if (d == D_OUT)  return "\x1b[1;32m";   /* outbound: bright green */
+            if (d == D_IN)   return "\x1b[36m";     /* inbound: cyan          */
+            if (d == D_CONN || d == D_ACCEPT) return "\x1b[1;33m";  /* setup  */
+            return "\x1b[37m";
+        }
+        case EV_ERR: return "\x1b[1;31m";
+        default:     return "\x1b[37m";
     }
 }
 
@@ -706,7 +609,7 @@ static void draw_pane(int pane, int top, int height, const char *title) {
         int row = top + height - 1 - i;      /* newest at the bottom */
         if (i < found) {
             Event *e = ring_at(r, idx[i]);
-            draw_row(row, ev_color(e), e->text);
+            draw_row(row, ev_color(e), ev_shown(e));
         } else {
             ofmt("\x1b[%d;1H\x1b[K", row);
         }
@@ -722,10 +625,9 @@ static void draw_status(void) {
         ofmt(" %s ", g_paused ? "\x1b[1;31mPAUSED\x1b[0m\x1b[7m" : "LIVE");
         ofmt("| %s ", g_active == PANE_NET ? "net" : "sys");
         if (g_filter[0]) ofmt("| /%s ", g_filter);
-        static const char *pkt_name[] = { "flow", "peer", "ALL-HOST" };
-        ofmt("| pkts:%s(%d) ", pkt_name[g_pkt_mode], g_flow_n);
+        if (g_raw)       ostr("| RAW ");
         ostr("| tab pane  \xe2\x86\x91\xe2\x86\x93/pgup/pgdn scroll  end live  "
-             "space pause  / filter  a pkts  c clear  q quit");
+             "space pause  / filter  r raw  c clear  q quit");
     }
     ostr("\x1b[0m");
 }
@@ -736,8 +638,9 @@ static void render(void) {
     int h_sys  = g_rows - 1 - split;
 
     g_outlen = 0;
-    draw_pane(PANE_NET, 2, h_net, "[ NETWORK LIVE TRAFFIC (SYS & RAW) ]");
-    draw_pane(PANE_SYS, split + 1, h_sys, "[ CRITICAL SYSCALLS & ERRORS ]");
+    draw_pane(PANE_NET, 2, h_net,
+              "[ NETWORK  time      pid  proto       dir op        peer ]");
+    draw_pane(PANE_SYS, split + 1, h_sys, "[ FILES, PROCESSES & ERRORS ]");
     draw_status();
     oflush();
     g_dirty = 0;
@@ -802,8 +705,7 @@ static void key_normal(const char *b, size_t n, size_t *consumed) {
         case '/': case 'f':
                    g_editing = 1; g_edit[0] = '\0'; g_edit_len = 0;
                    g_dirty = 1; break;
-        case 'a': g_pkt_mode = (g_pkt_mode + 1) % PKT_MODE_N;
-                  g_ring[PANE_NET].scroll = 0; g_dirty = 1; break;
+        case 'r': g_raw = !g_raw; g_dirty = 1; break;
         case 'c': memset(&g_ring[g_active], 0, sizeof(Ring)); g_dirty = 1; break;
         case 'g': scroll_by((int)g_ring[g_active].count); break;
         case 'G': case 'e': scroll_by(-(int)g_ring[g_active].count); break;
@@ -828,19 +730,15 @@ static void read_keys(void) {
 /* -------------------------------------------------------------------- main */
 
 int main(int argc, char *argv[]) {
-    if (argc < 3) {
-        fprintf(stderr, "Usage: %s <strace_fifo> <tcpdump_fifo>\n", argv[0]);
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <strace_fifo>\n", argv[0]);
         return 1;
     }
 
-    Source src[2] = {0};
-    src[0].fd = open(argv[1], O_RDONLY | O_NONBLOCK);
-    src[0].parse = parse_strace;
-    src[1].fd = open(argv[2], O_RDONLY | O_NONBLOCK);
-    src[1].parse = parse_pcap;
-
-    if (src[0].fd < 0 || src[1].fd < 0) {
-        perror("Error opening FIFOs");
+    Source src = {0};
+    src.fd = open(argv[1], O_RDONLY | O_NONBLOCK);
+    if (src.fd < 0) {
+        perror("Error opening FIFO");
         return 1;
     }
     if (!isatty(STDOUT_FILENO)) {
@@ -850,31 +748,27 @@ int main(int argc, char *argv[]) {
 
     term_setup();
 
-    struct pollfd fds[3];
-    fds[0].fd = src[0].fd; fds[0].events = POLLIN;
-    fds[1].fd = src[1].fd; fds[1].events = POLLIN;
-    fds[2].fd = STDIN_FILENO; fds[2].events = POLLIN;
+    struct pollfd fds[2];
+    fds[0].fd = src.fd;       fds[0].events = POLLIN;
+    fds[1].fd = STDIN_FILENO; fds[1].events = POLLIN;
 
     while (!g_quit && !g_signalled) {
         if (g_resized) { g_resized = 0; term_size(); g_dirty = 1; }
 
-        int ret = poll(fds, 3, 100);
+        int ret = poll(fds, 2, 100);
         if (ret < 0) {
             if (errno == EINTR) continue;
             break;
         }
 
-        for (int i = 0; i < 2; i++) {
-            if (fds[i].fd < 0) continue;
-            /* POLLHUP without POLLIN is the writer closing: drain, then stop
-             * polling this fd. Leaving it armed is what made the old filter
-             * spin at 100% CPU once the traced shell exited. */
-            if (fds[i].revents & (POLLIN | POLLHUP | POLLERR)) {
-                src_pump(&src[i]);
-                if (src[i].eof) { fds[i].fd = -1; g_dirty = 1; }
-            }
+        /* POLLHUP without POLLIN is the writer closing: drain, then stop
+         * polling this fd. Leaving it armed would spin the loop at 100% CPU
+         * once the traced shell exits. */
+        if (fds[0].fd >= 0 && (fds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+            src_pump(&src);
+            if (src.eof) { fds[0].fd = -1; g_dirty = 1; }
         }
-        if (fds[2].revents & POLLIN) read_keys();
+        if (fds[1].revents & POLLIN) read_keys();
 
         if (g_dirty) render();
     }
