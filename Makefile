@@ -1,14 +1,16 @@
 CC = gcc
-CFLAGS = -O2 -Wall -Wextra
+CFLAGS = -O2 -Wall -Wextra -Iinclude
 TARGET_C = trace_wrap_mon
 PREFIX ?= /usr/local/bin
+
+SRC = src/trace_wrap_mon.c src/UI.c
 
 .PHONY: all clean install uninstall
 
 all: $(TARGET_C)
 
-$(TARGET_C): trace_wrap_mon.c
-	$(CC) $(CFLAGS) -o $@ $<
+$(TARGET_C): $(SRC) $(wildcard include/*.h)
+	$(CC) $(CFLAGS) -o $@ $(SRC)
 
 clean:
 	rm -f $(TARGET_C)

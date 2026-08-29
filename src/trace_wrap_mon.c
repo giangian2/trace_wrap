@@ -22,119 +22,16 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
-#include <termios.h>
 #include <unistd.h>
+#include "RingBuffer.h"
+#include "Trace.h"
+#include "UI.h"
 
-#define MAX_LINE   2048
-#define DISP_LEN   192
-#define RING_CAP   4096
-#define SRC_BUF    (MAX_LINE * 4)
-#define OUT_BUF    (1 << 20)
-#define MAX_FILTER 96
-#define ENDP_LEN   64
-
-/* ------------------------------------------------------------------ events */
-
-typedef enum { EV_NET = 0, EV_SYS, EV_ERR } EvType;
-
-typedef struct {
-    EvType type;
-    long   pid;                /* -1 when unknown */
-    int    failed;             /* syscall returned a real error */
-    char   ts[16];             /* timestamp as printed by strace -tt */
-    char   name[32];           /* syscall name */
-    char   text[MAX_LINE];     /* the original strace line, newline stripped */
-    char   disp[DISP_LEN];     /* rendered network line; empty for EV_SYS */
-} Event;
-
-typedef struct {
-    Event  ev[RING_CAP];
-    size_t head;               /* next slot to write */
-    size_t count;              /* live entries, capped at RING_CAP */
-    size_t total;              /* events ever pushed, for the status bar */
-    size_t scroll;             /* 0 = follow tail, N = N matching lines back */
-} Ring;
-
-enum { PANE_NET = 0, PANE_SYS = 1, PANE_N = 2 };
-
-static Ring g_ring[PANE_N];
-
-/* --------------------------------------------------------------- ui state */
-
-static int   g_rows = 24, g_cols = 80;
-static int   g_active = PANE_NET;
-static int   g_paused = 0;
-static int   g_quit = 0;
-static int   g_dirty = 1;
-static int   g_editing = 0;                  /* filter prompt is open */
-static int   g_raw = 0;                      /* show raw strace lines up top */
-static char  g_filter[MAX_FILTER] = "";
-static char  g_edit[MAX_FILTER] = "";
-static size_t g_edit_len = 0;
-
-static volatile sig_atomic_t g_resized = 1;
-static volatile sig_atomic_t g_signalled = 0;
-
-static struct termios g_saved_tio;
-static int g_tio_saved = 0;
-
-/* ------------------------------------------------------------ output buffer
- * One write() per frame: assembling the whole screen in memory and flushing it
- * in a single syscall is what keeps the redraw flicker-free.
- */
-
-static char   g_out[OUT_BUF];
-static size_t g_outlen;
-
-static void oput(const char *s, size_t n) {
-    if (g_outlen + n > sizeof(g_out)) n = sizeof(g_out) - g_outlen;
-    memcpy(g_out + g_outlen, s, n);
-    g_outlen += n;
-}
-
-static void ostr(const char *s) { oput(s, strlen(s)); }
-
-static void ofmt(const char *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    int n = vsnprintf(g_out + g_outlen, sizeof(g_out) - g_outlen, fmt, ap);
-    va_end(ap);
-    if (n > 0) g_outlen += (size_t)n < sizeof(g_out) - g_outlen
-                         ? (size_t)n : sizeof(g_out) - g_outlen - 1;
-}
-
-static void oflush(void) {
-    size_t off = 0;
-    while (off < g_outlen) {
-        ssize_t n = write(STDOUT_FILENO, g_out + off, g_outlen - off);
-        if (n > 0) { off += (size_t)n; continue; }
-        if (n < 0 && errno == EINTR) continue;
-        break;
-    }
-    g_outlen = 0;
-}
-
-/* --------------------------------------------------------- network events
- * strace -yy annotates every descriptor with what sits behind it:
- *   5<TCP:[172.17.163.162:52590->104.20.23.154:443]>   an established socket
- *   5<TCP:[967498]>                                    a socket, not yet connected
- *   7<UDP:[965268]>
- *   3<UNIX-STREAM:[965263]>                            a unix socket
- *   3</etc/passwd>                                     a plain file
- * Everything the old flow table used to reconstruct from /proc is right here,
- * on the very line that reports the syscall.
- */
-
-typedef struct {
-    char proto[12];            /* "TCP", "UDP", "UNIX-STREAM", ... */
-    char local[ENDP_LEN];      /* "172.17.163.162:52590", or empty */
-    char peer[ENDP_LEN];       /* "104.20.23.154:443", or empty     */
-} FdInfo;
+Event  *g_ring[PANE_N];               /* one heap ring buffer per pane */
+size_t  g_scroll[PANE_N];             /* how far back each pane is scrolled */
 
 static void copy_until(char *dst, size_t cap, const char *src, const char *stop) {
     size_t k = 0;
@@ -218,8 +115,6 @@ static void scan_sockaddr_peer(const char *line, char *dst, size_t cap) {
     }
 }
 
-typedef enum { D_PLAIN, D_OUT, D_IN, D_CONN, D_ACCEPT, D_CLOSE } Dir;
-
 static const char *dir_glyph(Dir d) {
     switch (d) {
         case D_OUT:    return "\xe2\x86\x91";   /* up arrow    */
@@ -231,7 +126,7 @@ static const char *dir_glyph(Dir d) {
     }
 }
 
-static Dir dir_of(const char *name) {
+Dir dir_of(const char *name) {
     if (!strncmp(name, "send", 4) || !strcmp(name, "write") ||
         !strcmp(name, "writev"))                        return D_OUT;
     if (!strncmp(name, "recv", 4) || !strcmp(name, "read") ||
@@ -313,29 +208,12 @@ static int fmt_net(Event *e, const char *p, const char *ret) {
 
 /* ------------------------------------------------------------------- ring */
 
-static const char *ev_shown(const Event *e) {
-    return (e->type == EV_NET && !g_raw && e->disp[0]) ? e->disp : e->text;
-}
-
-static int matches(const Event *e) {
-    if (g_filter[0] == '\0') return 1;
-    return strcasestr(e->text, g_filter) != NULL ||
-           (e->disp[0] && strcasestr(e->disp, g_filter) != NULL);
-}
-
-static Event *ring_at(Ring *r, size_t k) {   /* k = 0 is the oldest entry */
-    return &r->ev[(r->head + RING_CAP - r->count + k) % RING_CAP];
-}
-
-static void ring_push(Ring *r, const Event *e) {
-    r->ev[r->head] = *e;
-    r->head = (r->head + 1) % RING_CAP;
-    if (r->count < RING_CAP) r->count++;
-    r->total++;
-    /* A frozen view must stay frozen: if we are scrolled back (or paused) and
-     * the new event would be visible, push the anchor along with it. */
-    if ((r->scroll > 0 || g_paused) && matches(e) && r->scroll < RING_CAP)
-        r->scroll++;
+static void pane_push(int pane, const Event *e) {
+    ring_insert(g_ring[pane], *e);
+    /* A frozen view must stay frozen: if we are scrolled back (or paused),
+     * push the anchor along with the new entry so it doesn't slide into view. */
+    if ((g_scroll[pane] > 0 || g_paused) && g_scroll[pane] < RING_CAP)
+        g_scroll[pane]++;
 }
 
 /* ---------------------------------------------------------------- parsing */
@@ -483,21 +361,9 @@ static int parse_strace(const char *line, Event *e) {
 }
 
 static void emit(const Event *e) {
-    ring_push(&g_ring[e->type == EV_NET ? PANE_NET : PANE_SYS], e);
+    pane_push(e->type == EV_NET ? PANE_NET : PANE_SYS, e);
     g_dirty = 1;
 }
-
-/* ------------------------------------------------------------- line source
- * read() on a non-blocking fd hands back arbitrary chunks, so the source keeps
- * a carry buffer holding the tail of a line until its newline shows up.
- */
-
-typedef struct {
-    int    fd;
-    int    eof;
-    size_t len;
-    char   buf[SRC_BUF];
-} Source;
 
 static void src_line(char *line) {
     size_t n = strlen(line);
@@ -544,235 +410,6 @@ static void src_pump(Source *s) {
         }
         s->len -= (size_t)(start - s->buf);
         memmove(s->buf, start, s->len);
-    }
-}
-
-/* ------------------------------------------------------------- terminal io */
-
-static void term_restore(void) {
-    ostr("\x1b[?25h"      /* show cursor          */
-         "\x1b[0m"        /* reset attributes     */
-         "\x1b[?1049l");  /* leave alternate screen */
-    oflush();
-    if (g_tio_saved) tcsetattr(STDIN_FILENO, TCSAFLUSH, &g_saved_tio);
-}
-
-static void on_winch(int sig) { (void)sig; g_resized = 1; }
-static void on_term(int sig)  { (void)sig; g_signalled = 1; }
-
-static void term_setup(void) {
-    if (tcgetattr(STDIN_FILENO, &g_saved_tio) == 0) {
-        struct termios raw = g_saved_tio;
-        raw.c_lflag &= ~(ICANON | ECHO | ISIG);
-        raw.c_iflag &= ~(IXON | ICRNL);
-        raw.c_cc[VMIN] = 0;
-        raw.c_cc[VTIME] = 0;
-        tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
-        g_tio_saved = 1;
-    }
-    atexit(term_restore);
-
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = on_winch;
-    sigaction(SIGWINCH, &sa, NULL);
-    sa.sa_handler = on_term;
-    sigaction(SIGINT,  &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
-    signal(SIGPIPE, SIG_IGN);
-
-    ostr("\x1b[?1049h"    /* alternate screen: the shell scrollback survives */
-         "\x1b[?25l"      /* hide cursor                                     */
-         "\x1b[2J");      /* clear                                           */
-    oflush();
-}
-
-static void term_size(void) {
-    struct winsize ws;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row && ws.ws_col) {
-        g_rows = ws.ws_row;
-        g_cols = ws.ws_col;
-    }
-    if (g_rows < 8)  g_rows = 8;
-    if (g_cols < 20) g_cols = 20;
-    if (g_cols > MAX_LINE - 1) g_cols = MAX_LINE - 1;
-}
-
-/* --------------------------------------------------------------- rendering */
-
-static const char *ev_color(const Event *e) {
-    if (e->failed) return "\x1b[1;31m";
-    switch (e->type) {
-        case EV_NET: {
-            Dir d = dir_of(e->name);
-            if (d == D_OUT)  return "\x1b[1;32m";   /* outbound: bright green */
-            if (d == D_IN)   return "\x1b[36m";     /* inbound: cyan          */
-            if (d == D_CONN || d == D_ACCEPT) return "\x1b[1;33m";  /* setup  */
-            return "\x1b[37m";
-        }
-        case EV_ERR: return "\x1b[1;31m";
-        default:     return "\x1b[37m";
-    }
-}
-
-static void draw_row(int row, const char *color, const char *text) {
-    ofmt("\x1b[%d;1H\x1b[K", row);
-    if (color) ostr(color);
-    int budget = g_cols - 1;
-    int len = (int)strlen(text);
-    oput(text, (size_t)(len < budget ? len : budget));
-    ostr("\x1b[0m");
-}
-
-/* Walks the ring backwards collecting the visible slice, then paints it. */
-static void draw_pane(int pane, int top, int height, const char *title) {
-    Ring *r = &g_ring[pane];
-    size_t idx[512];
-    int cap = height < 512 ? height : 512;
-    int found = 0;
-    size_t skipped = 0, shown_total = 0;
-
-    for (size_t k = r->count; k-- > 0; ) {
-        Event *e = ring_at(r, k);
-        if (!matches(e)) continue;
-        shown_total++;
-        if (skipped < r->scroll) { skipped++; continue; }
-        if (found < cap) idx[found++] = k;
-    }
-    /* Scrolled past the top (ring evicted entries under us): clamp and repaint. */
-    if (found == 0 && r->scroll > 0 && shown_total > 0) {
-        r->scroll = shown_total > (size_t)cap ? shown_total - (size_t)cap : 0;
-        draw_pane(pane, top, height, title);
-        return;
-    }
-
-    int active = (pane == g_active);
-    ofmt("\x1b[%d;1H\x1b[K", top - 1);
-    ofmt("%s %s ", active ? "\x1b[1;33m" : "\x1b[1;36m", title);
-    if (shown_total < r->total) ofmt("\x1b[0m\x1b[2m%zu/%zu ev", shown_total, r->total);
-    else                        ofmt("\x1b[0m\x1b[2m%zu ev", r->total);
-    if (r->scroll) ofmt("  \x1b[1;35m^%zu", r->scroll);
-    ostr("\x1b[0m");
-
-    for (int i = 0; i < height; i++) {
-        int row = top + height - 1 - i;      /* newest at the bottom */
-        if (i < found) {
-            Event *e = ring_at(r, idx[i]);
-            draw_row(row, ev_color(e), ev_shown(e));
-        } else {
-            ofmt("\x1b[%d;1H\x1b[K", row);
-        }
-    }
-}
-
-static void draw_status(void) {
-    ofmt("\x1b[%d;1H\x1b[K\x1b[7m", g_rows);
-
-    if (g_editing) {
-        ofmt(" filter: %s_", g_edit);
-    } else {
-        ofmt(" %s ", g_paused ? "\x1b[1;31mPAUSED\x1b[0m\x1b[7m" : "LIVE");
-        ofmt("| %s ", g_active == PANE_NET ? "net" : "sys");
-        if (g_filter[0]) ofmt("| /%s ", g_filter);
-        if (g_raw)       ostr("| RAW ");
-        ostr("| tab pane  \xe2\x86\x91\xe2\x86\x93/pgup/pgdn scroll  end live  "
-             "space pause  / filter  r raw  c clear  q quit");
-    }
-    ostr("\x1b[0m");
-}
-
-static void render(void) {
-    int split  = g_rows / 2;
-    int h_net  = split - 2;
-    int h_sys  = g_rows - 1 - split;
-
-    g_outlen = 0;
-    draw_pane(PANE_NET, 2, h_net,
-              "[ NETWORK - time pid proto dir syscall peer bytes/duration ]");
-    draw_pane(PANE_SYS, split + 1, h_sys, "[ FILES, PROCESSES & ERRORS ]");
-    draw_status();
-    oflush();
-    g_dirty = 0;
-}
-
-/* ------------------------------------------------------------------- input */
-
-static void scroll_by(int delta) {
-    Ring *r = &g_ring[g_active];
-    if (delta > 0) r->scroll += (size_t)delta;
-    else if ((size_t)(-delta) >= r->scroll) r->scroll = 0;
-    else r->scroll -= (size_t)(-delta);
-    if (r->scroll > r->count) r->scroll = r->count;
-    g_dirty = 1;
-}
-
-static void key_edit(char c) {
-    if (c == '\r' || c == '\n') {
-        memcpy(g_filter, g_edit, sizeof(g_filter));
-        g_editing = 0;
-        g_ring[PANE_NET].scroll = g_ring[PANE_SYS].scroll = 0;
-    } else if (c == 27) {
-        g_editing = 0;
-    } else if ((c == 127 || c == 8) && g_edit_len) {
-        g_edit[--g_edit_len] = '\0';
-    } else if (isprint((unsigned char)c) && g_edit_len < sizeof(g_edit) - 1) {
-        g_edit[g_edit_len++] = c;
-        g_edit[g_edit_len] = '\0';
-    }
-    g_dirty = 1;
-}
-
-static void key_normal(const char *b, size_t n, size_t *consumed) {
-    int page = (g_rows / 2) - 3;
-    if (page < 1) page = 1;
-    *consumed = 1;
-
-    if (b[0] == 27 && n >= 3 && b[1] == '[') {      /* CSI sequence */
-        *consumed = 3;
-        switch (b[2]) {
-            case 'A': scroll_by(1);      return;
-            case 'B': scroll_by(-1);     return;
-            case 'Z': g_active ^= 1; g_dirty = 1; return;   /* shift-tab */
-            case 'H': scroll_by((int)g_ring[g_active].count); return;
-            case 'F': scroll_by(-(int)g_ring[g_active].count); return;
-            case '5': case '6':
-                if (n >= 4 && b[3] == '~') {
-                    *consumed = 4;
-                    scroll_by(b[2] == '5' ? page : -page);
-                }
-                return;
-            default: return;
-        }
-    }
-
-    switch (b[0]) {
-        case 'q': case 3:  g_quit = 1; break;                 /* q / ctrl-c */
-        case '\t': g_active ^= 1; g_dirty = 1; break;
-        case ' ':  g_paused = !g_paused;
-                   if (!g_paused) g_ring[g_active].scroll = 0;
-                   g_dirty = 1; break;
-        case '/': case 'f':
-                   g_editing = 1; g_edit[0] = '\0'; g_edit_len = 0;
-                   g_dirty = 1; break;
-        case 'r': g_raw = !g_raw; g_dirty = 1; break;
-        case 'c': memset(&g_ring[g_active], 0, sizeof(Ring)); g_dirty = 1; break;
-        case 'g': scroll_by((int)g_ring[g_active].count); break;
-        case 'G': case 'e': scroll_by(-(int)g_ring[g_active].count); break;
-        default: break;
-    }
-}
-
-static void read_keys(void) {
-    char b[256];
-    ssize_t n = read(STDIN_FILENO, b, sizeof(b));
-    if (n <= 0) return;
-
-    size_t i = 0;
-    while (i < (size_t)n) {
-        if (g_editing) { key_edit(b[i]); i++; continue; }
-        size_t used = 1;
-        key_normal(b + i, (size_t)n - i, &used);
-        i += used;
     }
 }
 
