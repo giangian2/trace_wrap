@@ -17,7 +17,7 @@ clean:
 
 install: all
 	install -d $(DESTDIR)$(PREFIX)
-	install -m 755 trace_wrap.sh $(DESTDIR)$(PREFIX)/trace_wrap
+	install -m 755 scripts/trace_wrap.sh $(DESTDIR)$(PREFIX)/trace_wrap
 	install -m 755 $(TARGET_C) $(DESTDIR)$(PREFIX)/$(TARGET_C)
 
 uninstall:
